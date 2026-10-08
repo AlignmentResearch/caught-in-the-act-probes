@@ -1,10 +1,12 @@
 """Parity against reference scores on real activations, with the published probes.
 
 The fixture is the Hugging Face dataset ``FIXTURE_REPO`` at ``FIXTURE_REVISION``. It holds, per model, a few
-rows of activations and token masks and the reference scores for those rows, but no probes. Each probe is
-loaded with :func:`probe_inference.load_probe_from_hub` from the published weights at the package's pinned
-``WEIGHTS_REVISION``, exactly as users load it; the fixture's ``manifest.json`` names its path there. Both
-downloads go through the Hub cache (``HF_HOME``), so repeated runs and cached CI runs reuse them.
+rows of activations and token masks and the reference scores for those rows, but no probes. The references
+were computed with the probes published at ``PARITY_WEIGHTS_REVISION``, an earlier commit of the weights
+repository than the package's ``WEIGHTS_REVISION``. Each probe is loaded with
+:func:`probe_inference.load_probe_from_hub` from the weights at ``PARITY_WEIGHTS_REVISION``, as users load
+it; the fixture's ``manifest.json`` names its path there. Both downloads go through the Hub cache
+(``HF_HOME``), so repeated runs and cached CI runs reuse them.
 
 - ``nemotron-3-super-120b``: EFC and axial; one batch mixes 27- and 24-token read windows;
 - ``qwen3.5-9b``: linear, MLP, EFC and axial.
@@ -23,14 +25,38 @@ from probe_inference.load import WEIGHTS_REPO, WEIGHTS_REVISION
 
 FIXTURE_REPO = "AlignmentResearch/probe-inference-parity"
 FIXTURE_REVISION = "14382a5fe404dc1ce7a13edbacaecd3964024353"
+#: The commit of ``WEIGHTS_REPO`` whose probes the fixture's reference scores were computed with.
+PARITY_WEIGHTS_REVISION = "22a7a341078ba1722cfad73ef7e40bdc25aa74c2"
 SETS = {"nemotron-3-super-120b": ("efc", "axial"), "qwen3.5-9b": ("linear", "mlp", "efc", "axial")}
 STACKED_TOLERANCE = {"efc": 5e-5, "axial": 1e-5}
 PER_LAYER = ("linear", "mlp")
 #: Every (set, architecture) the fixture has references for is exactly one of these cases.
 STACKED_CASES = [(name, arch) for name, archs in SETS.items() for arch in archs if arch not in PER_LAYER]
 PER_LAYER_CASES = [(name, arch) for name, archs in SETS.items() for arch in archs if arch in PER_LAYER]
-#: Every probe published in the weights repository, as ``<model>/<arch>``.
-PUBLISHED_MODELS = (
+ARCHS = ("linear", "mlp", "efc", "axial")
+#: The models whose probes the weights repository holds at ``WEIGHTS_REVISION``, each with all of ``ARCHS``,
+#: and the layers those probes read.
+PUBLISHED_LAYERS = {
+    "qwen3.5-2b": (7, 10, 13, 16, 19, 22),
+    "qwen3.5-9b": (10, 13, 18, 21, 26, 29),
+    "qwen3.5-27b": (19, 27, 35, 43, 51, 58),
+    "qwen3.5-122b-a10b": (14, 20, 26, 32, 38, 43),
+    "qwen3.5-397b-a17b": (18, 25, 33, 40, 48, 54),
+    "nemotron-3-nano-30b-a3b": (16, 22, 29, 35, 42, 47),
+    "nemotron-3-super-120b-a12b": (26, 37, 48, 59, 70, 79),
+    "nemotron-3-ultra-550b-a55b": (32, 45, 59, 72, 86, 97),
+    "kimi-k3": (28, 39, 51, 62, 74, 84),
+}
+PUBLISHED_MODELS = tuple(PUBLISHED_LAYERS)
+#: Read window and token aggregation of each architecture.
+WINDOWS = {
+    "linear": ("second-last-token-generation", "mean"),
+    "mlp": ("second-last-token-generation", "mean"),
+    "efc": ("last-user-and-assistant-generation", "mean"),
+    "axial": ("last-user-and-assistant-generation", "last"),
+}
+#: The models whose probes the weights repository holds at ``PARITY_WEIGHTS_REVISION``.
+PARITY_PUBLISHED_MODELS = (
     "qwen3.5-2b",
     "qwen3.5-9b",
     "qwen3.6-27b",
@@ -100,9 +126,9 @@ def _load_set(root: Path, name: str) -> tuple[dict[int, torch.Tensor], dict[str,
 
 
 def _published_probe(fixture_root: Path, name: str, arch: str):
-    """The probe the fixture's references are for, loaded from the published weights at the pinned revision."""
+    """The probe the fixture's references are for, loaded from the weights at ``PARITY_WEIGHTS_REVISION``."""
     manifest = json.loads((fixture_root / "manifest.json").read_text())
-    return load_probe_from_hub(manifest["sets"][name]["probes"][arch], revision=WEIGHTS_REVISION)
+    return load_probe_from_hub(manifest["sets"][name]["probes"][arch], revision=PARITY_WEIGHTS_REVISION)
 
 
 def test_manifest_and_references_cover_every_tested_probe(fixture_root: Path) -> None:
@@ -117,16 +143,57 @@ def test_manifest_and_references_cover_every_tested_probe(fixture_root: Path) ->
     assert set(STACKED_TOLERANCE) == {arch for _, arch in STACKED_CASES}
 
 
-def test_every_published_probe_exists_at_the_pinned_revision() -> None:
-    """All 28 published probes are present at ``WEIGHTS_REVISION``, not only the ones parity scores."""
+def _assert_published_set(revision: str, models: tuple[str, ...]) -> None:
+    """The weights repository at ``revision`` holds exactly ``models`` x ``ARCHS`` as probe directories."""
     from huggingface_hub import HfApi
 
-    files = set(HfApi().list_repo_files(WEIGHTS_REPO, revision=WEIGHTS_REVISION))
-    expected = {f"{model}/{arch}" for model in PUBLISHED_MODELS for arch in ("linear", "mlp", "efc", "axial")}
+    files = set(HfApi().list_repo_files(WEIGHTS_REPO, revision=revision))
+    expected = {f"{model}/{arch}" for model in models for arch in ARCHS}
     missing = sorted(probe for probe in expected if f"{probe}/probe_metadata.json" not in files)
-    assert not missing, f"{WEIGHTS_REPO}@{WEIGHTS_REVISION} lacks {missing}"
+    assert not missing, f"{WEIGHTS_REPO}@{revision} lacks {missing}"
     present = {path.rsplit("/", 1)[0] for path in files if path.endswith("/probe_metadata.json")}
-    assert present == expected, f"unexpected probes at the pin: {sorted(present - expected)}"
+    assert present == expected, f"unexpected probes at {revision}: {sorted(present - expected)}"
+
+
+def test_every_published_probe_exists_at_the_pinned_revision() -> None:
+    """All 36 probes are present at ``WEIGHTS_REVISION``, the revision users load by default."""
+    assert len(PUBLISHED_MODELS) * len(ARCHS) == 36
+    _assert_published_set(WEIGHTS_REVISION, PUBLISHED_MODELS)
+
+
+def test_published_metadata_at_the_pinned_revision() -> None:
+    """Every probe at ``WEIGHTS_REVISION`` names its model's layers, its window and its aggregation."""
+    from huggingface_hub import hf_hub_download
+
+    for model, layers in PUBLISHED_LAYERS.items():
+        for arch in ARCHS:
+            path = hf_hub_download(WEIGHTS_REPO, f"{model}/{arch}/probe_metadata.json", revision=WEIGHTS_REVISION)
+            metadata = json.loads(Path(path).read_text())
+            assert metadata["architecture"] == arch, (model, arch)
+            assert metadata["layers"] == list(layers), (model, arch)
+            assert (metadata["obfuscate_over"], metadata["eval_sequence_aggregator"]) == WINDOWS[arch], (model, arch)
+            if arch in PER_LAYER:
+                assert metadata["layer_rule"]["used_layers"] == list(layers), (model, arch)
+
+
+def test_default_revision_probe_loads_and_scores() -> None:
+    """A probe loads from the default revision, and its normaliser is the trained one."""
+    probe = load_probe_from_hub("kimi-k3/linear")
+    assert probe.layers == probe.used_layers == PUBLISHED_LAYERS["kimi-k3"]
+    assert probe.d_model == 7168 and probe.read_window == WINDOWS["linear"][0]
+    assert all(float(module.input_scale) != 1.0 for module in probe.modules.values())
+    generator = torch.Generator().manual_seed(0)
+    acts = {layer: torch.randn(2, 5, probe.d_model, generator=generator) for layer in probe.layers}
+    completion = torch.tensor([[False, False, True, True, True], [False, False, False, True, True]])
+    mask = probe.read_mask(~completion, completion, torch.tensor([0, 1]))
+    scores = probe.score_batch(acts, mask)
+    assert scores.shape == (2,) and bool(((scores > 0) & (scores < 1)).all())
+
+
+def test_every_parity_probe_exists_at_the_parity_revision() -> None:
+    """All 28 probes are present at ``PARITY_WEIGHTS_REVISION``, the revision the parity references are for."""
+    assert len(PARITY_PUBLISHED_MODELS) * len(ARCHS) == 28
+    _assert_published_set(PARITY_WEIGHTS_REVISION, PARITY_PUBLISHED_MODELS)
 
 
 def _read_mask(probe, masks: dict[str, torch.Tensor]) -> torch.Tensor:

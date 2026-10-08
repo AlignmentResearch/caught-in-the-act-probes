@@ -39,9 +39,11 @@ repository `AlignmentResearch/probe-inference-weights` at the commit pinned by
 `probe_inference.load.WEIGHTS_REVISION`, and loads it. Only that probe's directory is downloaded. Pass
 `repo_id`, `revision` and `repo_type` to load from another repository. The published probes are
 `<model>/<arch>/`, with `<arch>` in `linear`, `mlp`, `efc` and `axial`, for these models: `qwen3.5-2b`,
-`qwen3.5-9b`, `qwen3.6-27b`, `qwen3.5-122b-a10b`, `qwen3.5-397b-a17b`, `nemotron-3-nano-30b-a3b` and
-`nemotron-3-super-120b-a12b`. The repository's card gives each model's revision and layers, and the
-licences of the models the probes were trained on.
+`qwen3.5-9b`, `qwen3.5-27b`, `qwen3.5-122b-a10b`, `qwen3.5-397b-a17b`, `nemotron-3-nano-30b-a3b`,
+`nemotron-3-super-120b-a12b`, `nemotron-3-ultra-550b-a55b` and `kimi-k3`. The repository's card gives
+each model's revision and layers, how the probes were trained, and the licences of the models the probes
+were trained on. The earlier probes, which have `qwen3.6-27b` and lack `qwen3.5-27b`,
+`nemotron-3-ultra-550b-a55b` and `kimi-k3`, are at revision `22a7a341078ba1722cfad73ef7e40bdc25aa74c2`.
 
 What `score` returns depends on the architecture:
 
@@ -72,13 +74,14 @@ differ from this are not meaningful.
 
 | Part | Contract |
 |---|---|
-| Layer index | Layer $k$ is the output of decoder block $k$, 0-indexed, of the model loaded with `AutoModelForCausalLM`. For Qwen3.5/3.6 that is `model.model.layers[k]`. For Nemotron-3 it is `layers[k]` of the inner `NemotronHModel`, which Nano-30B holds at `model.backbone` and Super-120B at `model.model`. This equals Hugging Face `output_hidden_states[k + 1]`. The capture is a forward hook on the block (for Qwen3.5-397B-A17B, a vLLM hook at the same decoder-layer outputs). For the last layer ($N-1$), the hook instead reads the final norm's output when the model's `output_hidden_states` does. None of the probes below reads the last layer. |
+| Layer index | Layer $k$ is the output of decoder block $k$, 0-indexed, of the model loaded with `AutoModelForCausalLM`. For Qwen3.5/3.6 that is `model.model.layers[k]`. For Nemotron-3 it is `layers[k]` of the inner `NemotronHModel`, which Nano-30B holds at `model.backbone` and Super-120B at `model.model`. This equals Hugging Face `output_hidden_states[k + 1]`. The activations of the probes at `WEIGHTS_REVISION` were captured with vLLM hooks at these decoder-layer outputs. None of the probes below reads the last layer ($N-1$), whose Hugging Face hidden state is the final norm's output. |
+| Layer index, Kimi K3 | Kimi K3's decoder layers use attention residuals, so a layer returns no single hidden state. Layer $k$ is the attention-residual mixture that layer $k+1$ reads, computed with the model's own `attn_res` op and layer $k+1$'s residual-attention weights. |
 | Stream | The residual stream, as the Hugging Face block returns it. |
-| Dtype | The model ran in bfloat16, and the activations were stored in bfloat16. `score` runs the probes in float32. (Training ran the probe forward under bfloat16 autocast.) |
+| Dtype | The model ran in bfloat16, and the activations were stored in bfloat16. Kimi K3 ran from its released MXFP4 checkpoint (`moonshotai/Kimi-K3`, MXFP4 weights), not a bf16 one; its activations were also stored in bfloat16. `score` runs the probes in float32. (Training ran the probe forward under bfloat16 autocast.) |
 | Context | The whole conversation, with the follow-up appended, goes through the model. The probes read only positions inside their window, but those activations depend on the full context. |
-| Chat rendering | The model's own chat template, with thinking disabled. The follow-up is a final user turn and a prefilled assistant answer, closed by the end-of-turn token. In training, the whole conversation went through the chat template, which puts a newline after every end-of-turn token. The parity fixture's activations instead have the follow-up's `<\|im_start\|>` directly after the previous turn's end-of-turn token, with no newline. |
-| Read window, linear and MLP | `second-last-token-generation`: exactly one token, the last token of the assistant answer before its end-of-turn token. For a prefilled `No.` or `Yes.` it is the full stop. |
-| Read window, EFC and axial | `last-user-and-assistant-generation`: every token from the first token of the final user turn (its `<\|im_start\|>`) through the assistant's end-of-turn token, inclusive. |
+| Chat rendering | The model's own chat template, with thinking disabled. The follow-up is a final user turn and a prefilled assistant answer, closed by the end-of-turn token. Nemotron-3: the template's default, which removes the reasoning of every assistant turn before the final user turn (reasoning elided). Kimi K3: its template cannot disable thinking, so the follow-up's assistant turn has an empty reasoning block before the prefilled answer (see [Follow-up rendering](#follow-up-rendering)). In training, the whole conversation went through the chat template, which for Qwen and Nemotron-3 puts a newline after every end-of-turn token. The parity fixture's activations instead have the follow-up's `<\|im_start\|>` directly after the previous turn's end-of-turn token, with no newline. |
+| Read window, linear and MLP | `second-last-token-generation`: exactly one token, the token before the final end-of-turn token. For Qwen and Nemotron-3 that is the last token of the assistant answer; for a prefilled `No.` or `Yes.` it is the full stop. For Kimi K3 it is the `<\|sep\|>` of the closing `<\|close\|>message<\|sep\|>`, six tokens after the full stop. |
+| Read window, EFC and axial | `last-user-and-assistant-generation`: every token from the first token of the final user turn (its `<\|im_start\|>`, or `<\|open\|>` for Kimi K3) through the assistant's end-of-turn token, inclusive. |
 | Token layout | `score` gathers the read tokens to the front of each row, in order, and zero-pads the rest. The probe's padding mask marks the non-zero rows. Pass the full-length activations and the read mask; do not compact them yourself. This matters for the axial probe, whose rotary embedding counts positions. |
 
 ### Follow-up rendering
@@ -89,7 +92,10 @@ A follow-up is a question with a prefilled answer, for example
 ```
 Qwen3.5 / 3.6:  <|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nNo.<|im_end|>
 Nemotron-3:     <|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think></think>No.<|im_end|>
+Kimi K3:        <|open|>message role="user"<|sep|>{question}<|close|>message<|sep|><|end_of_msg|><|open|>message role="assistant"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|>No.<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>
 ```
+
+Kimi K3's end-of-turn token is `<|end_of_msg|>`.
 
 ### Building the read mask
 
@@ -97,9 +103,12 @@ Nemotron-3:     <|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<
 probe's window. The arguments are:
 
 - `completion_mask`: True on the assistant answer tokens after the empty thinking block, plus the
-  end-of-turn token. For a `No.` prefill that is `No`, `.` and `<|im_end|>`.
+  end-of-turn token. For a `No.` prefill that is `No`, `.` and `<|im_end|>`. For Kimi K3 it is every token
+  after `<|open|>response<|sep|>`: `No`, `.`, `<|close|>`, `response`, `<|sep|>`, `<|close|>`, `message`,
+  `<|sep|>` and `<|end_of_msg|>`.
 - `prompt_mask`: True on every other real token of the row.
-- `followup_start_positions`: the index of the final user turn's first token (`<|im_start|>`).
+- `followup_start_positions`: the index of the final user turn's first token (`<|im_start|>`, or
+  `<|open|>` for Kimi K3).
 
 A hand-built boolean mask that selects the positions in the table above works too.
 
@@ -107,18 +116,39 @@ A hand-built boolean mask that selects the positions in the table above works to
 
 These are six layers at depth fractions 0.3, 0.42, 0.55, 0.67, 0.8 and 0.9, computed as
 `round(f * num_hidden_layers)`. Each probe's `probe_metadata.json` `layers` field is authoritative. The
-Nemotron-3 models were loaded from local re-saved checkpoints with fused expert tensors, made from
-the Hub snapshots at these revisions.
+last column gives the weights revision that holds the model's probes. For the probes at the old revision
+`22a7a341`, the Nemotron-3 models were loaded from local re-saved checkpoints with fused expert tensors,
+made from the Hub snapshots at these revisions.
 
-| Model (HF revision) | Blocks | `d_model` | Layers |
-|---|---|---|---|
-| `Qwen/Qwen3.5-2B` (`15852e8c`) | 24 | 2048 | 7, 10, 13, 16, 19, 22 |
-| `Qwen/Qwen3.5-9B` (`c2022362`) | 32 | 4096 | 10, 13, 18, 21, 26, 29 |
-| `Qwen/Qwen3.6-27B` (`6a9e13bd`) | 64 | 5120 | 19, 27, 35, 43, 51, 58 |
-| `Qwen/Qwen3.5-122B-A10B` (`dc4d3484`) | 48 | 3072 | 14, 20, 26, 32, 38, 43 |
-| `Qwen/Qwen3.5-397B-A17B` (`84726181`) | 60 | 4096 | 18, 25, 33, 40, 48, 54 |
-| `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` (`bf77c317`) | 52 | 2688 | 16, 22, 29, 35, 42, 47 |
-| `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` (`2dc98e2a`) | 88 | 4096 | 26, 37, 48, 59, 70, 79 |
+| Model (HF revision) | Blocks | `d_model` | Layers | Weights revision |
+|---|---|---|---|---|
+| `Qwen/Qwen3.5-2B` (`15852e8c`) | 24 | 2048 | 7, 10, 13, 16, 19, 22 | both |
+| `Qwen/Qwen3.5-9B` (`c2022362`) | 32 | 4096 | 10, 13, 18, 21, 26, 29 | both |
+| `Qwen/Qwen3.5-27B` (`fc05daec`) | 64 | 5120 | 19, 27, 35, 43, 51, 58 | `WEIGHTS_REVISION` only |
+| `Qwen/Qwen3.6-27B` (`6a9e13bd`) | 64 | 5120 | 19, 27, 35, 43, 51, 58 | `22a7a341` only |
+| `Qwen/Qwen3.5-122B-A10B` (`dc4d3484`) | 48 | 3072 | 14, 20, 26, 32, 38, 43 | both |
+| `Qwen/Qwen3.5-397B-A17B` (`84726181`) | 60 | 4096 | 18, 25, 33, 40, 48, 54 | both |
+| `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` (`bf77c317`) | 52 | 2688 | 16, 22, 29, 35, 42, 47 | both |
+| `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` (`2dc98e2a`) | 88 | 4096 | 26, 37, 48, 59, 70, 79 | both |
+| `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` (`77df655d`) | 108 | 8192 | 32, 45, 59, 72, 86, 97 | `WEIGHTS_REVISION` only |
+| `moonshotai/Kimi-K3` (`f831ab66`) | 93 | 7168 | 28, 39, 51, 62, 74, 84 | `WEIGHTS_REVISION` only |
+
+"Both" means the old revision `22a7a341` and `WEIGHTS_REVISION` hold probes for the model. They are
+different probes: the probes at `WEIGHTS_REVISION` were retrained on FIBSv1 (see [Artifacts](#artifacts)).
+
+## Artifacts
+
+| Artifact | Location |
+|---|---|
+| Probe weights | [`AlignmentResearch/probe-inference-weights`](https://huggingface.co/AlignmentResearch/probe-inference-weights), tag [`camera-ready`](https://huggingface.co/AlignmentResearch/probe-inference-weights/tree/camera-ready) (commit `05def1c1`, which `WEIGHTS_REVISION` pins) |
+| Training data | FIBSv1, [`AlignmentResearch/fibs-v1`](https://huggingface.co/datasets/AlignmentResearch/fibs-v1) at revision `65dccf12`. It may not be public yet. |
+| Parity fixture | [`AlignmentResearch/probe-inference-parity`](https://huggingface.co/datasets/AlignmentResearch/probe-inference-parity), see [Tests](#tests) |
+
+The probes at `WEIGHTS_REVISION` were trained on the model's own activations over FIBSv1: 152,980
+training rows and 5,000 validation rows, the same rows for every model, seed 0. Linear and MLP trained for
+up to 6 epochs, EFC and axial for up to 4, with early stopping on the validation loss; each published
+probe is the checkpoint with the lowest validation loss. The weights repository's card gives each probe's
+validation AUROC.
 
 ## Probe directory format
 
@@ -161,12 +191,14 @@ The unit tests use synthetic probes and run on CPU in seconds. `tests/test_parit
 package with reference scores on real activations, using the published probes. Its fixture (about
 150 MiB) is the Hugging Face dataset `AlignmentResearch/probe-inference-parity` (public; no token
 needed) at the commit pinned by `FIXTURE_REVISION` in that file. It holds a few rows of activations and
-token masks per model and the reference scores for those rows, but no probes. Each probe is loaded with
-`load_probe_from_hub` from the published weights at the pinned `WEIGHTS_REVISION`, exactly as users load
-it. Both downloads go through the Hub cache (`HF_HOME`); cache that directory in CI to avoid
-re-downloading them (`.github/workflows/ci.yml` does). A missing fixture, an unreachable repository or a
-probe missing at the pinned weights revision fails the parity tests. They need network access even
-with a warm cache, because one test lists the weights repository's files at the pinned revision.
+token masks per model and the reference scores for those rows, but no probes. The references were
+computed with the earlier probes, so each probe is loaded with `load_probe_from_hub` from the weights at
+`PARITY_WEIGHTS_REVISION` in that file (`22a7a341`), not at the package's `WEIGHTS_REVISION`. Both
+downloads go through the Hub cache (`HF_HOME`); cache that directory in CI to avoid re-downloading them
+(`.github/workflows/ci.yml` does). A missing fixture, an unreachable repository or a probe missing at
+either weights revision fails the parity tests. Other tests in that file check that `WEIGHTS_REVISION`
+holds all 36 probes with the layers in the table above, and that one of them loads and scores. The tests
+need network access even with a warm cache, because they list the weights repository's files.
 
 | Set | Probes | Notes |
 |---|---|---|
@@ -179,7 +211,8 @@ This package is released under the MIT licence (see `LICENSE`). `EFCProbe` (in `
 Goodfire's early-fusion covariance probe, from Goodfire code that is not public. Confirm the terms for
 that code with Goodfire before any public release of this repository.
 
-The published probe weights and test fixture on the Hugging Face Hub are also MIT. They are derived
-from Qwen models (Apache-2.0) and NVIDIA Nemotron-3 models (NVIDIA Nemotron Open Model License), whose
-licence texts and attribution notices ship with them (`NOTICE` and the `LICENSE-*` files in each
-repository).
+The published probe weights and test fixture on the Hugging Face Hub are also MIT. The weights at
+`WEIGHTS_REVISION` are derived from Qwen models (Apache-2.0), NVIDIA Nemotron-3 Nano and Super (NVIDIA
+Nemotron Open Model License), NVIDIA Nemotron-3 Ultra (OpenMDW-1.1) and Kimi K3 (Kimi K3 License). The
+test fixture is derived from Qwen and Nemotron-3 Super models. The licence texts and attribution notices
+of these models ship with each repository (`NOTICE` and the `LICENSE-*` files).
