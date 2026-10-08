@@ -40,7 +40,7 @@ _SCALED_MODES = frozenset({"unit_norm", "centered_unit_norm"})
 #: The published probe weights on the Hugging Face Hub, laid out as ``<model>/<arch>/``.
 WEIGHTS_REPO = "AlignmentResearch/probe-inference-weights"
 #: The commit of ``WEIGHTS_REPO`` that :func:`load_probe_from_hub` loads by default.
-WEIGHTS_REVISION = "22a7a341078ba1722cfad73ef7e40bdc25aa74c2"
+WEIGHTS_REVISION = "05def1c13a70237cda3b717d785813918b8a22fa"
 
 
 class InputScaleError(ValueError):
